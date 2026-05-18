@@ -10,6 +10,19 @@ PROXY_JS="$INSTALL_DIR/proxy.js"
 SERVICE_NAME="any-proxy"
 SERVICE_FILE="/etc/systemd/system/${SERVICE_NAME}.service"
 DEFAULT_PORT=3000
+PROXY_JS_URL="${PROXY_JS_URL:-https://raw.githubusercontent.com/tokinx/any-proxy/refs/heads/main/install.sh}"
+SCRIPT_SOURCE="${BASH_SOURCE[0]:-$0}"
+SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$SCRIPT_SOURCE")" 2>/dev/null && pwd || pwd)
+SOURCE_PROXY_JS="$SCRIPT_DIR/proxy.js"
+TMP_PROXY_JS=""
+
+cleanup() {
+    if [[ -n "$TMP_PROXY_JS" && -f "$TMP_PROXY_JS" ]]; then
+        rm -f "$TMP_PROXY_JS"
+    fi
+}
+
+trap cleanup EXIT
 
 # ---- 权限检测 ----
 if [[ $EUID -eq 0 ]]; then
@@ -27,7 +40,7 @@ if ! command -v systemctl &>/dev/null; then
     exit 1
 fi
 
-# ---- 交互输入：兼容 curl|bash 场景（从 /dev/tty 读取） ----
+# ---- 交互输入：优先从 /dev/tty 读取 ----
 ask() {
     local prompt="$1" default="${2:-}" reply
     if [[ -n "$default" ]]; then
@@ -67,12 +80,43 @@ get_latest_bun_version() {
         || true
 }
 
-# ---- 提取当前 proxy.js 的端口配置 ----
+# ---- 定位安装时使用的 proxy.js：优先本地，缺失则远程下载 ----
+resolve_source_proxy_js() {
+    if [[ -f "$SOURCE_PROXY_JS" ]]; then
+        printf '%s' "$SOURCE_PROXY_JS"
+        return 0
+    fi
+
+    if ! command -v curl &>/dev/null; then
+        echo "未找到本地 proxy.js，且未检测到 curl，无法下载: $PROXY_JS_URL" >&2
+        return 1
+    fi
+
+    TMP_PROXY_JS=$(mktemp)
+    echo "未找到本地 proxy.js，尝试下载: $PROXY_JS_URL"
+    if ! curl -fsSL "$PROXY_JS_URL" -o "$TMP_PROXY_JS"; then
+        echo "proxy.js 下载失败: $PROXY_JS_URL" >&2
+        rm -f "$TMP_PROXY_JS"
+        TMP_PROXY_JS=""
+        return 1
+    fi
+
+    printf '%s' "$TMP_PROXY_JS"
+}
+
+# ---- 提取当前安装的端口配置 ----
 detect_existing_port() {
-    local file="$1" port=""
-    [[ -f "$file" ]] || return 0
-    port=$(grep -oE '^[[:space:]]*const[[:space:]]+PORT[[:space:]]*=[[:space:]]*[0-9]+' "$file" 2>/dev/null \
-        | head -1 | grep -oE '[0-9]+' || true)
+    local service_file="$1" proxy_file="$2" port=""
+
+    if [[ -f "$service_file" ]]; then
+        port=$(grep -oE '^Environment=PORT=[0-9]+' "$service_file" 2>/dev/null \
+            | head -1 | grep -oE '[0-9]+' || true)
+    fi
+
+    if [[ -z "$port" && -f "$proxy_file" ]]; then
+        port=$(grep -oE '^[[:space:]]*const[[:space:]]+PORT[[:space:]]*=[[:space:]]*[0-9]+' "$proxy_file" 2>/dev/null \
+            | head -1 | grep -oE '[0-9]+' || true)
+    fi
 
     printf '%s' "$port"
 }
@@ -83,8 +127,8 @@ echo "============================="
 
 # ---- 已安装检测：提示重装/卸载/退出 ----
 EXISTING_PORT=""
-if [[ -f "$PROXY_JS" ]]; then
-    EXISTING_PORT=$(detect_existing_port "$PROXY_JS")
+if [[ -f "$PROXY_JS" || -f "$SERVICE_FILE" ]]; then
+    EXISTING_PORT=$(detect_existing_port "$SERVICE_FILE" "$PROXY_JS")
     echo
     echo "检测到 Any Proxy 已安装${EXISTING_PORT:+（当前端口: $EXISTING_PORT）}"
     echo "请选择操作:"
@@ -179,239 +223,10 @@ echo "使用端口: $PORT"
 echo "创建工作目录: $INSTALL_DIR"
 $SUDO mkdir -p "$INSTALL_DIR"
 
-# ---- 4. 写入 JS 代理脚本 ----
-echo "生成代理脚本: $PROXY_JS"
-$SUDO tee "$PROXY_JS" >/dev/null <<'PROXY_EOF'
-#!/usr/bin/env bun
-import { serve } from "bun";
-
-const PORT = __PORT__;
-
-// 从代理自身的请求 URL 中剥离下游目标 URL，并做协议补全/纠正：
-//   http://host:PORT/https://example.com/p  -> https://example.com/p
-//   http://host:PORT/example.com/p          -> https://example.com/p   (自动补 https://)
-//   http://host:PORT/https:/example.com/p   -> https://example.com/p   (修复被规范化的单斜杠)
-function extractTarget(raw) {
-  let path;
-  const protoEnd = raw.indexOf("://");
-  if (protoEnd >= 0) {
-    const pathStart = raw.indexOf("/", protoEnd + 3);
-    path = pathStart >= 0 ? raw.slice(pathStart + 1) : "";
-  } else {
-    path = raw;
-  }
-  path = path.replace(/^\/+/, "");
-  if (!path) return "";
-  // 修复 https:/ wss:/ 等被规范化的单斜杠形式
-  path = path.replace(/^(wss?|https?):\/+/i, "$1://");
-  // 没有协议时默认补 https://（WS 升级时再转 wss://）
-  if (!/^(wss?|https?):\/\//i.test(path)) {
-    path = "https://" + path;
-  }
-  return path;
-}
-
-// HTTP(S) → WS(S) 映射，已是 ws/wss 则保持
-function toWsUrl(url) {
-  if (/^wss?:\/\//i.test(url)) return url;
-  return url.replace(/^https?:\/\//i, (m) =>
-    /^https/i.test(m) ? "wss://" : "ws://",
-  );
-}
-
-// 1005/1006 是保留 close code，不能直接传给 close()
-function safeCloseCode(code) {
-  if (!code || code === 1005 || code === 1006) return 1000;
-  return code;
-}
-
-// hop-by-hop / WS 协议内部头，转发到下游时跳过
-function shouldStripHeader(name) {
-  const n = name.toLowerCase();
-  return (
-    n === "host" ||
-    n === "connection" ||
-    n === "upgrade" ||
-    n === "content-length" ||
-    n.startsWith("sec-websocket-")
-  );
-}
-
-serve({
-  port: PORT,
-
-  async fetch(req, srv) {
-    try {
-      // ==== WebSocket 升级：同步 upgrade，下游连接延迟到 open 钩子 ====
-      if (req.headers.get("upgrade")?.toLowerCase() === "websocket") {
-        const httpTarget = extractTarget(req.url);
-        if (!httpTarget) {
-          return new Response("Missing target URL", { status: 400 });
-        }
-        const wsTarget = toWsUrl(httpTarget);
-
-        const clientProtocols = (req.headers.get("sec-websocket-protocol") || "")
-          .split(",")
-          .map((s) => s.trim())
-          .filter(Boolean);
-
-        const fwdHeaders = {};
-        for (const [k, v] of req.headers) {
-          if (!shouldStripHeader(k)) fwdHeaders[k] = v;
-        }
-
-        // 子协议必须在握手时立即回应；先 echo 客户端要求的第一个，
-        // 若与下游协商不一致，下游会主动 close，逻辑上能闭环
-        const upgradeOpts = {
-          data: {
-            wsTarget,
-            clientProtocols,
-            fwdHeaders,
-            queue: [],
-            ready: false,
-            downstream: null,
-          },
-        };
-        if (clientProtocols.length) {
-          // Bun 要求 headers 是 Headers 实例或非空对象，空对象会触发校验失败
-          const h = new Headers();
-          h.set("sec-websocket-protocol", clientProtocols[0]);
-          upgradeOpts.headers = h;
-        }
-
-        const upgraded = srv.upgrade(req, upgradeOpts);
-
-        if (!upgraded) {
-          console.error("[ws] upgrade rejected:", wsTarget);
-          return new Response("Upgrade rejected", { status: 500 });
-        }
-        return undefined;
-      }
-
-      // ==== 普通 HTTP 转发 ====
-      const target = extractTarget(req.url);
-
-      if (!target) {
-        const origin = new URL(req.url).origin;
-        return new Response(
-          "Usage: " + origin + "/<target-url>\n" +
-          "协议可省略，默认 https；WebSocket 走 Upgrade 头自动判断。\n" +
-          "示例:\n" +
-          "  " + origin + "/example.com\n" +
-          "  " + origin + "/https://example.com/path?q=1\n" +
-          "  new WebSocket('ws://host:PORT/example.com/socket')\n",
-          { status: 400, headers: { "content-type": "text/plain; charset=utf-8" } },
-        );
-      }
-
-      const reqHeaders = new Headers(req.headers);
-      reqHeaders.delete("host");
-
-      const resp = await fetch(target, {
-        method: req.method,
-        headers: reqHeaders,
-        body: ["GET", "HEAD"].includes(req.method) ? undefined : req.body,
-        // 自动跟随重定向：GitHub Releases 等需要多级跳转的场景必须开启，
-        // 否则客户端拿到的是 302，跟随后又不会走代理，且部分客户端会卡住等待 body。
-        redirect: "follow",
-      });
-
-      const respHeaders = new Headers(resp.headers);
-      respHeaders.delete("content-encoding");
-      respHeaders.delete("content-length");
-
-      return new Response(resp.body, {
-        status: resp.status,
-        statusText: resp.statusText,
-        headers: respHeaders,
-      });
-    } catch (err) {
-      console.error("[fetch error]", err?.stack || err);
-      return new Response("Error: " + (err?.message || String(err)), { status: 500 });
-    }
-  },
-
-  websocket: {
-    // 长连接友好：5 分钟空闲超时，sendPings 自动保活，扛住常见 NAT 5min 超时
-    idleTimeout: 300,
-    sendPings: true,
-
-    open(ws) {
-      const { wsTarget, clientProtocols, fwdHeaders } = ws.data;
-
-      let downstream;
-      try {
-        // Bun 客户端 WebSocket：
-        // - 同时有 headers 时走 Bun 扩展 options 对象
-        // - 只有 protocols 时走标准位置参数
-        const hasHeaders = Object.keys(fwdHeaders).length > 0;
-        if (hasHeaders) {
-          const opts = { headers: fwdHeaders };
-          if (clientProtocols.length) opts.protocols = clientProtocols;
-          downstream = new WebSocket(wsTarget, opts);
-        } else if (clientProtocols.length) {
-          downstream = new WebSocket(wsTarget, clientProtocols);
-        } else {
-          downstream = new WebSocket(wsTarget);
-        }
-        downstream.binaryType = "arraybuffer";
-      } catch (e) {
-        console.error("[ws] downstream init failed:", e?.message || e, "url=", wsTarget);
-        try { ws.close(1011, "downstream init failed"); } catch {}
-        return;
-      }
-
-      ws.data.downstream = downstream;
-      console.log("[ws] connecting downstream:", wsTarget);
-
-      downstream.addEventListener("open", () => {
-        ws.data.ready = true;
-        const q = ws.data.queue;
-        for (const m of q) {
-          try { downstream.send(m); } catch {}
-        }
-        q.length = 0;
-        console.log("[ws] downstream open:", wsTarget);
-      });
-
-      downstream.addEventListener("message", (e) => {
-        try { ws.send(e.data); } catch {}
-      });
-
-      downstream.addEventListener("close", (e) => {
-        try { ws.close(safeCloseCode(e.code), e.reason || ""); } catch {}
-      });
-
-      downstream.addEventListener("error", (e) => {
-        console.error("[ws] downstream error:", e?.message || e?.type || "unknown");
-        try { ws.close(1011, "downstream error"); } catch {}
-      });
-    },
-
-    message(ws, msg) {
-      const ds = ws.data.downstream;
-      if (!ws.data.ready || !ds || ds.readyState !== 1) {
-        ws.data.queue.push(msg);
-        return;
-      }
-      try { ds.send(msg); } catch (e) {
-        console.error("[ws] send to downstream failed:", e?.message || e);
-      }
-    },
-
-    close(ws, code, reason) {
-      const ds = ws.data.downstream;
-      if (ds) {
-        try { ds.close(safeCloseCode(code), reason || ""); } catch {}
-      }
-    },
-  },
-});
-
-console.log("Any Proxy running on port " + PORT + " (HTTP + WebSocket)");
-PROXY_EOF
-$SUDO sed -i "s|__PORT__|$PORT|" "$PROXY_JS"
-$SUDO chmod +x "$PROXY_JS"
+# ---- 4. 安装 JS 代理脚本 ----
+echo "安装代理脚本: $PROXY_JS"
+SOURCE_PROXY_JS_RESOLVED=$(resolve_source_proxy_js) || exit 1
+$SUDO install -m 755 "$SOURCE_PROXY_JS_RESOLVED" "$PROXY_JS"
 
 # ---- 5. 创建 systemd 服务 ----
 echo "创建 systemd 服务: $SERVICE_FILE"
@@ -429,6 +244,7 @@ Restart=always
 RestartSec=3
 User=root
 Environment=PATH=$BUN_DIR:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+Environment=PORT=$PORT
 
 [Install]
 WantedBy=multi-user.target
