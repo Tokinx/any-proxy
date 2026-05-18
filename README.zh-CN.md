@@ -16,7 +16,7 @@
 ## 原生安装
 
 ```bash
-bash -c "$(curl -sSL https://raw.githubusercontent.com/tokinx/any-proxy/main/install.sh)"
+ANY_PROXY_LANG=zh-CN && bash -c "$(curl -sSL https://raw.githubusercontent.com/tokinx/any-proxy/main/install.sh)"
 # 安装后再次执行可管理白名单 / 卸载
 ```
 

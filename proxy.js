@@ -161,10 +161,11 @@ function isAllowedClientIp(address) {
 
 const ALLOWLIST = compileAllowlist(ALLOWLIST_RAW);
 
-// 从代理自身的请求 URL 中剥离下游目标 URL，并做协议补全/纠正：
+// Strip the downstream target URL from this proxy's own request URL,
+// fixing protocol completion / normalization edge cases:
 //   http://host:PORT/https://example.com/p  -> https://example.com/p
-//   http://host:PORT/example.com/p          -> https://example.com/p   (自动补 https://)
-//   http://host:PORT/https:/example.com/p   -> https://example.com/p   (修复被规范化的单斜杠)
+//   http://host:PORT/example.com/p          -> https://example.com/p   (default to https://)
+//   http://host:PORT/https:/example.com/p   -> https://example.com/p   (restore single-slash normalization)
 function extractTarget(raw) {
   let path;
   const protoEnd = raw.indexOf("://");
@@ -176,16 +177,16 @@ function extractTarget(raw) {
   }
   path = path.replace(/^\/+/, "");
   if (!path) return "";
-  // 修复 https:/ wss:/ 等被规范化的单斜杠形式
+  // Restore single-slash forms like https:/ or wss:/ produced by URL normalization
   path = path.replace(/^(wss?|https?):\/+/i, "$1://");
-  // 没有协议时默认补 https://（WS 升级时再转 wss://）
+  // Default to https:// when no protocol is present (WS upgrade re-maps to wss:// later)
   if (!/^(wss?|https?):\/\//i.test(path)) {
     path = "https://" + path;
   }
   return path;
 }
 
-// HTTP(S) → WS(S) 映射，已是 ws/wss 则保持
+// Map HTTP(S) -> WS(S); leave ws/wss as-is
 function toWsUrl(url) {
   if (/^wss?:\/\//i.test(url)) return url;
   return url.replace(/^https?:\/\//i, (m) =>
@@ -193,13 +194,13 @@ function toWsUrl(url) {
   );
 }
 
-// 1005/1006 是保留 close code，不能直接传给 close()
+// 1005/1006 are reserved close codes and cannot be passed to close() directly
 function safeCloseCode(code) {
   if (!code || code === 1005 || code === 1006) return 1000;
   return code;
 }
 
-// hop-by-hop / WS 协议内部头，转发到下游时跳过
+// Hop-by-hop / WS-internal headers — strip when forwarding to the downstream
 function shouldStripHeader(name) {
   const n = name.toLowerCase();
   return (
@@ -221,7 +222,7 @@ serve({
         return new Response("Forbidden", { status: 403 });
       }
 
-      // ==== WebSocket 升级：同步 upgrade，下游连接延迟到 open 钩子 ====
+      // ==== WebSocket upgrade: handshake synchronously, connect downstream lazily in the open hook ====
       if (isWebSocket) {
         const httpTarget = extractTarget(req.url);
         if (!httpTarget) {
@@ -239,8 +240,8 @@ serve({
           if (!shouldStripHeader(k)) fwdHeaders[k] = v;
         }
 
-        // 子协议必须在握手时立即回应；先 echo 客户端要求的第一个，
-        // 若与下游协商不一致，下游会主动 close，逻辑上能闭环
+        // Subprotocol must be answered during the handshake; echo the first one the client asked for.
+        // If the downstream disagrees, it will close the connection on its own — the loop closes cleanly.
         const upgradeOpts = {
           data: {
             wsTarget,
@@ -252,7 +253,7 @@ serve({
           },
         };
         if (clientProtocols.length) {
-          // Bun 要求 headers 是 Headers 实例或非空对象，空对象会触发校验失败
+          // Bun requires headers to be a Headers instance or a non-empty object; an empty object fails validation
           const h = new Headers();
           h.set("sec-websocket-protocol", clientProtocols[0]);
           upgradeOpts.headers = h;
@@ -267,15 +268,15 @@ serve({
         return undefined;
       }
 
-      // ==== 普通 HTTP 转发 ====
+      // ==== Plain HTTP forward ====
       const target = extractTarget(req.url);
 
       if (!target) {
         const origin = new URL(req.url).origin;
         return new Response(
           "Usage: " + origin + "/<target-url>\n" +
-          "协议可省略，默认 https；WebSocket 走 Upgrade 头自动判断。\n" +
-          "示例:\n" +
+          "Protocol is optional and defaults to https; WebSocket is detected via the Upgrade header.\n" +
+          "Examples:\n" +
           "  " + origin + "/example.com\n" +
           "  " + origin + "/https://example.com/path?q=1\n" +
           "  new WebSocket('ws://host:PORT/example.com/socket')\n",
@@ -290,8 +291,9 @@ serve({
         method: req.method,
         headers: reqHeaders,
         body: ["GET", "HEAD"].includes(req.method) ? undefined : req.body,
-        // 自动跟随重定向：GitHub Releases 等需要多级跳转的场景必须开启，
-        // 否则客户端拿到的是 302，跟随后又不会走代理，且部分客户端会卡住等待 body。
+        // Auto-follow redirects: required for multi-hop targets like GitHub Releases.
+        // Otherwise the client gets a 302, the follow-up does not go through the proxy,
+        // and some clients hang waiting for a body.
         redirect: "follow",
       });
 
@@ -311,7 +313,7 @@ serve({
   },
 
   websocket: {
-    // 长连接友好：5 分钟空闲超时，sendPings 自动保活，扛住常见 NAT 5min 超时
+    // Long-connection friendly: 5-minute idle timeout, sendPings keeps the link alive across the common 5-min NAT timeout
     idleTimeout: 300,
     sendPings: true,
 
@@ -320,9 +322,9 @@ serve({
 
       let downstream;
       try {
-        // Bun 客户端 WebSocket：
-        // - 同时有 headers 时走 Bun 扩展 options 对象
-        // - 只有 protocols 时走标准位置参数
+        // Bun client WebSocket:
+        // - when headers are present, use the Bun-extended options object
+        // - protocols only -> use the standard positional argument
         const hasHeaders = Object.keys(fwdHeaders).length > 0;
         if (hasHeaders) {
           const opts = { headers: fwdHeaders };

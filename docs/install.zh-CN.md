@@ -26,6 +26,23 @@
 PROXY_JS_URL="https://your-host/proxy.js" bash -c "$(curl -sSL https://your-host/install.sh)"
 ```
 
+## 显示语言
+
+脚本默认英文，传入 `zh-CN` 切换为中文，未知值回退英文。
+
+```bash
+# 命令行参数（curl 一键安装时需要用 `_` 占位 $0）
+bash -c "$(curl -sSL .../install.sh)" _ --lang=zh-CN
+
+# 或通过环境变量
+ANY_PROXY_LANG=zh-CN bash -c "$(curl -sSL .../install.sh)"
+
+# 本地文件
+bash install.sh --lang=zh-CN
+```
+
+优先级：`--lang` 参数 > `ANY_PROXY_LANG` 环境变量 > 默认英文。
+
 ## 白名单管理
 
 - 仅作用于 HTTP/HTTPS 请求，WebSocket 升级不受限制

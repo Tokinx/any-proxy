@@ -26,6 +26,23 @@ If `proxy.js` is not present locally, the script downloads it from `PROXY_JS_URL
 PROXY_JS_URL="https://your-host/proxy.js" bash -c "$(curl -sSL https://your-host/install.sh)"
 ```
 
+## Display language
+
+The installer ships in English; pass `zh-CN` to switch to Chinese. Unknown values fall back to English.
+
+```bash
+# CLI flag (the `_` is required as a placeholder for $0 in the curl one-liner)
+bash -c "$(curl -sSL .../install.sh)" _ --lang=zh-CN
+
+# Or via environment variable
+ANY_PROXY_LANG=zh-CN bash -c "$(curl -sSL .../install.sh)"
+
+# Local file
+bash install.sh --lang=zh-CN
+```
+
+Priority: `--lang` flag > `ANY_PROXY_LANG` env > default English.
+
 ## Allowlist
 
 - Only enforced on HTTP/HTTPS; WebSocket upgrades always bypass it.
