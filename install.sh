@@ -56,6 +56,17 @@ load_bun_path() {
     return 1
 }
 
+# ---- 查询 Bun 官方最新稳定版 ----
+get_latest_bun_version() {
+    command -v curl &>/dev/null || return 0
+
+    curl -fsSL --max-time 10 https://api.github.com/repos/oven-sh/bun/releases/latest 2>/dev/null \
+        | grep -oE '"tag_name":[[:space:]]*"bun-v[^"]+"' \
+        | head -1 \
+        | sed -E 's/.*"bun-v([^"]+)".*/\1/' \
+        || true
+}
+
 # ---- 提取当前 proxy.js 的端口配置 ----
 detect_existing_port() {
     local file="$1" port=""
@@ -130,11 +141,19 @@ if ! command -v bun &>/dev/null; then
 else
     BUN_VERSION=$(bun --version 2>/dev/null || echo "unknown")
     echo "Bun 已安装，当前版本: $BUN_VERSION"
-    UPGRADE_BUN=$(ask "是否升级 Bun 到最新版本？[y/N]" "N")
-    if [[ "$UPGRADE_BUN" =~ ^[Yy]$ ]]; then
-        echo "升级 Bun..."
-        bun upgrade || echo "升级失败，继续使用当前版本"
-        echo "当前版本: $(bun --version)"
+    LATEST_BUN_VERSION=$(get_latest_bun_version)
+    if [[ -n "$LATEST_BUN_VERSION" ]]; then
+        if [[ "$BUN_VERSION" == "$LATEST_BUN_VERSION" ]]; then
+            echo "Bun 已是最新版本"
+        else
+            echo "Bun 最新版本: $LATEST_BUN_VERSION"
+            UPGRADE_BUN=$(ask "是否升级 Bun 到最新版本？[y/N]" "N")
+            if [[ "$UPGRADE_BUN" =~ ^[Yy]$ ]]; then
+                echo "升级 Bun..."
+                bun upgrade || echo "升级失败，继续使用当前版本"
+                echo "当前版本: $(bun --version)"
+            fi
+        fi
     fi
 fi
 
