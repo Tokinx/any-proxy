@@ -38,6 +38,8 @@ docker run -d \
   ghcr.io/tokinx/any-proxy:latest
 ```
 
+The first start downloads Bun automatically. Mount `/opt/bun` if you want to reuse the downloaded runtime across container re-creations.
+
 See [docs/ci.md](docs/ci.md) for the image build pipeline.
 
 ## Configuration

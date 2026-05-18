@@ -38,6 +38,8 @@ docker run -d \
   ghcr.io/tokinx/any-proxy:latest
 ```
 
+首次启动会自动下载 Bun；如果想在容器重建后复用已下载的运行时，可以挂载 `/opt/bun`。
+
 镜像构建流程详见 [docs/ci.zh-CN.md](docs/ci.zh-CN.md)。
 
 ## 参数
