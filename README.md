@@ -8,6 +8,7 @@
 - 目标地址可省略协议，默认补 `https://`
 - 支持 `WebSocket` 升级转发
 - 自动跟随重定向
+- 支持 HTTP/HTTPS 访问白名单，支持单 IP 和 CIDR 网段
 - 同时提供 `systemd` 和 Docker 两种部署方式
 - GitHub Actions 可自动构建并发布 GHCR 镜像
 
@@ -50,6 +51,7 @@ PROXY_JS_URL="https://your-url/proxy.js" bash -c "$(curl -sSL https://your-url/i
 安装过程会：
 
 - 检测是否已安装，并提供重新安装、卸载、退出选项
+- 已安装场景下支持查看、添加、删除 HTTP/HTTPS 白名单
 - 检测本机 Bun 版本，仅在落后于官方稳定版时提示升级
 - 已安装场景下自动带出现有端口作为默认值
 - 将服务安装到 `systemd` 并设置开机自启
@@ -71,6 +73,21 @@ journalctl -u any-proxy -f
 
 卸载方式：重新运行 `install.sh`，选择“卸载”。
 
+## 白名单控制
+
+- 仅对 HTTP/HTTPS 请求生效
+- WebSocket 请求不受白名单限制
+- 为空时默认允许所有 IP
+- 支持单 IP 和 CIDR，例如 `192.168.1.10`、`192.168.0.0/16`、`10.0.0.0/24`
+
+`systemd` 安装方式下，白名单记录保存在：
+
+```text
+/etc/any-proxy.allowlist
+```
+
+重新运行 `install.sh` 时，可直接查看、添加、删除记录。
+
 ## Docker 部署
 
 ### 直接构建并运行
@@ -81,6 +98,7 @@ docker run -d \
   --name any-proxy \
   --restart unless-stopped \
   -e PORT=3000 \
+  -e IP_ALLOWLIST="192.168.1.10,192.168.0.0/16,10.0.0.0/24" \
   -p 3000:3000 \
   any-proxy:local
 ```
@@ -92,6 +110,13 @@ docker compose up -d --build
 ```
 
 仓库内已提供 [compose.yaml](./compose.yaml)，默认映射 `3000:3000`。
+可通过 `IP_ALLOWLIST` 环境变量传入逗号分隔的白名单，例如：
+
+```yaml
+environment:
+  PORT: 3000
+  IP_ALLOWLIST: "192.168.1.10,192.168.0.0/16,10.0.0.0/24"
+```
 
 ### 使用已发布镜像
 
@@ -108,6 +133,7 @@ docker run -d \
   --name any-proxy \
   --restart unless-stopped \
   -e PORT=3000 \
+  -e IP_ALLOWLIST="192.168.1.10,192.168.0.0/16" \
   -p 3000:3000 \
   ghcr.io/<owner>/<repo>:latest
 ```
@@ -136,6 +162,12 @@ new WebSocket('ws://127.0.0.1:3000/echo.websocket.events')
 3. `NODE_PORT`
 
 未设置时默认使用 `3000`。
+
+白名单环境变量：
+
+- `IP_ALLOWLIST`
+- 逗号分隔多个记录
+- 示例：`IP_ALLOWLIST="192.168.1.10,192.168.0.0/16,10.0.0.0/24"`
 
 ## GitHub Actions 镜像构建
 

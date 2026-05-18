@@ -13,6 +13,153 @@ function resolvePort() {
 }
 
 const PORT = resolvePort();
+const ALLOWLIST_RAW =
+  Bun.env.IP_ALLOWLIST || Bun.env.ALLOWLIST || Bun.env.WHITELIST || "";
+
+function normalizeIpLiteral(input) {
+  let ip = String(input || "").trim().toLowerCase();
+  if (!ip) return "";
+  if (ip.startsWith("[") && ip.endsWith("]")) {
+    ip = ip.slice(1, -1);
+  }
+  return ip.replace(/%.+$/, "");
+}
+
+function parseIpv4(ip) {
+  const parts = ip.split(".");
+  if (parts.length !== 4) return null;
+
+  let value = 0n;
+  for (const part of parts) {
+    if (!/^\d+$/.test(part)) return null;
+    const octet = Number.parseInt(part, 10);
+    if (!Number.isInteger(octet) || octet < 0 || octet > 255) return null;
+    value = (value << 8n) | BigInt(octet);
+  }
+
+  return { version: 4, bits: 32, value };
+}
+
+function parseIpv6(ip) {
+  if (!ip.includes(":")) return null;
+  if (ip.indexOf("::") !== ip.lastIndexOf("::")) return null;
+
+  const parseHextets = (part) => {
+    if (!part) return [];
+    const groups = part.split(":");
+    const out = [];
+
+    for (let i = 0; i < groups.length; i++) {
+      const group = groups[i];
+      if (!group) return null;
+
+      if (group.includes(".")) {
+        if (i !== groups.length - 1) return null;
+        const ipv4 = parseIpv4(group);
+        if (!ipv4) return null;
+        out.push(Number((ipv4.value >> 16n) & 0xffffn).toString(16));
+        out.push(Number(ipv4.value & 0xffffn).toString(16));
+        continue;
+      }
+
+      if (!/^[0-9a-f]{1,4}$/i.test(group)) return null;
+      out.push(group);
+    }
+
+    return out;
+  };
+
+  const hasCompression = ip.includes("::");
+  const [leftRaw, rightRaw = ""] = hasCompression ? ip.split("::") : [ip, ""];
+  const left = parseHextets(leftRaw);
+  const right = parseHextets(rightRaw);
+  if (!left || !right) return null;
+
+  let groups;
+  if (hasCompression) {
+    const missing = 8 - (left.length + right.length);
+    if (missing < 1) return null;
+    groups = [...left, ...Array(missing).fill("0"), ...right];
+  } else {
+    groups = left;
+    if (groups.length !== 8) return null;
+  }
+
+  if (groups.length !== 8) return null;
+
+  let value = 0n;
+  for (const group of groups) {
+    const hextet = Number.parseInt(group, 16);
+    if (!Number.isInteger(hextet) || hextet < 0 || hextet > 0xffff) return null;
+    value = (value << 16n) | BigInt(hextet);
+  }
+
+  return { version: 6, bits: 128, value };
+}
+
+function parseIpAddress(ip) {
+  const normalized = normalizeIpLiteral(ip);
+  if (!normalized) return null;
+  if (normalized.startsWith("::ffff:") && normalized.includes(".")) {
+    return parseIpv4(normalized.slice(7));
+  }
+  return parseIpv4(normalized) || parseIpv6(normalized);
+}
+
+function maskForPrefix(bits, prefix) {
+  if (prefix <= 0) return 0n;
+  if (prefix >= bits) return (1n << BigInt(bits)) - 1n;
+  return ((1n << BigInt(prefix)) - 1n) << BigInt(bits - prefix);
+}
+
+function compileAllowlist(raw) {
+  const rules = [];
+  const seen = new Set();
+
+  for (const entry of String(raw || "").split(",")) {
+    const normalized = normalizeIpLiteral(entry);
+    if (!normalized) continue;
+
+    const [addressRaw, prefixRaw] = normalized.split("/", 2);
+    const address = parseIpAddress(addressRaw);
+    if (!address) continue;
+
+    const prefix =
+      prefixRaw === undefined || prefixRaw === ""
+        ? address.bits
+        : Number.parseInt(prefixRaw, 10);
+    if (!Number.isInteger(prefix) || prefix < 0 || prefix > address.bits) continue;
+
+    const mask = maskForPrefix(address.bits, prefix);
+    const network = address.value & mask;
+    const key = `${address.version}:${prefix}:${network.toString(16)}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+
+    rules.push({
+      version: address.version,
+      prefix,
+      mask,
+      network,
+    });
+  }
+
+  return rules;
+}
+
+function matchesAllowlist(address, rule) {
+  const parsed = parseIpAddress(address);
+  if (!parsed || parsed.version !== rule.version) return false;
+  return (parsed.value & rule.mask) === rule.network;
+}
+
+function isAllowedClientIp(address) {
+  if (!ALLOWLIST.length) return true;
+  if (!address) return false;
+  return ALLOWLIST.some((rule) => matchesAllowlist(address, rule));
+}
+
+const ALLOWLIST = compileAllowlist(ALLOWLIST_RAW);
 
 // 从代理自身的请求 URL 中剥离下游目标 URL，并做协议补全/纠正：
 //   http://host:PORT/https://example.com/p  -> https://example.com/p
@@ -69,8 +216,13 @@ serve({
 
   async fetch(req, srv) {
     try {
+      const isWebSocket = req.headers.get("upgrade")?.toLowerCase() === "websocket";
+      if (!isWebSocket && !isAllowedClientIp(srv?.requestIP?.(req)?.address || "")) {
+        return new Response("Forbidden", { status: 403 });
+      }
+
       // ==== WebSocket 升级：同步 upgrade，下游连接延迟到 open 钩子 ====
-      if (req.headers.get("upgrade")?.toLowerCase() === "websocket") {
+      if (isWebSocket) {
         const httpTarget = extractTarget(req.url);
         if (!httpTarget) {
           return new Response("Missing target URL", { status: 400 });

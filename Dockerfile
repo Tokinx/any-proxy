@@ -4,7 +4,8 @@ WORKDIR /app
 
 COPY proxy.js ./proxy.js
 
-ENV PORT=3000
+ENV PORT=3000 \
+    IP_ALLOWLIST=
 
 EXPOSE 3000
 

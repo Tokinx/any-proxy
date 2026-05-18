@@ -9,6 +9,7 @@ INSTALL_DIR="/opt/any-proxy"
 PROXY_JS="$INSTALL_DIR/proxy.js"
 SERVICE_NAME="any-proxy"
 SERVICE_FILE="/etc/systemd/system/${SERVICE_NAME}.service"
+ALLOWLIST_FILE="/etc/any-proxy.allowlist"
 DEFAULT_PORT=3000
 PROXY_JS_URL="${PROXY_JS_URL:-https://raw.githubusercontent.com/tokinx/any-proxy/refs/heads/main/install.sh}"
 SCRIPT_SOURCE="${BASH_SOURCE[0]:-$0}"
@@ -104,6 +105,165 @@ resolve_source_proxy_js() {
     printf '%s' "$TMP_PROXY_JS"
 }
 
+# ---- 白名单记录管理 ----
+normalize_allowlist_entry() {
+    printf '%s' "$1" | tr -d '[:space:]' | tr '[:upper:]' '[:lower:]'
+}
+
+validate_allowlist_entry() {
+    local value="$1" ip prefix octet
+    [[ -n "$value" ]] || return 1
+    [[ "$value" != *,* ]] || return 1
+
+    if [[ "$value" =~ ^(([0-9]{1,3}\.){3}[0-9]{1,3})(/([0-9]|[12][0-9]|3[0-2]))?$ ]]; then
+        IFS='/' read -r ip prefix <<<"$value"
+        IFS='.' read -r -a octets <<<"$ip"
+        for octet in "${octets[@]}"; do
+            [[ "$octet" =~ ^[0-9]+$ ]] || return 1
+            (( octet >= 0 && octet <= 255 )) || return 1
+        done
+        return 0
+    fi
+
+    if [[ "$value" =~ : ]]; then
+        [[ "$value" =~ ^[0-9a-f:/.\[\]]+$ ]] || return 1
+        if [[ "$value" == */* ]]; then
+            prefix=${value##*/}
+            [[ "$prefix" =~ ^([0-9]|[1-9][0-9]|1[01][0-9]|12[0-8])$ ]] || return 1
+        fi
+        return 0
+    fi
+
+    return 1
+}
+
+load_allowlist_entries() {
+    ALLOWLIST_ENTRIES=()
+    [[ -f "$ALLOWLIST_FILE" ]] || return 0
+
+    mapfile -t ALLOWLIST_ENTRIES < <(
+        sed -e 's/[[:space:]]*#.*$//' -e '/^[[:space:]]*$/d' "$ALLOWLIST_FILE" 2>/dev/null \
+            | while IFS= read -r line; do
+                normalize_allowlist_entry "$line"
+                printf '\n'
+            done
+    )
+}
+
+save_allowlist_entries() {
+    local tmp
+    tmp=$(mktemp)
+
+    for entry in "${ALLOWLIST_ENTRIES[@]:-}"; do
+        [[ -n "$entry" ]] || continue
+        printf '%s\n' "$entry" >>"$tmp"
+    done
+
+    $SUDO install -m 600 "$tmp" "$ALLOWLIST_FILE"
+    rm -f "$tmp"
+}
+
+allowlist_contains_entry() {
+    local target="$1" entry
+    for entry in "${ALLOWLIST_ENTRIES[@]:-}"; do
+        [[ "$entry" == "$target" ]] && return 0
+    done
+    return 1
+}
+
+show_allowlist_entries() {
+    local i
+    load_allowlist_entries
+    echo
+    echo "当前 HTTP/HTTPS 白名单:"
+    if (( ${#ALLOWLIST_ENTRIES[@]} == 0 )); then
+        echo "  （空，默认允许所有 IP）"
+        return 0
+    fi
+
+    for i in "${!ALLOWLIST_ENTRIES[@]}"; do
+        printf '  %d) %s\n' "$((i + 1))" "${ALLOWLIST_ENTRIES[$i]}"
+    done
+}
+
+add_allowlist_entry() {
+    local raw value
+    raw=$(ask "请输入要添加的 IP 或 CIDR（如 192.168.1.10、192.168.0.0/16、10.0.0.0/24）" "")
+    value=$(normalize_allowlist_entry "$raw")
+
+    if ! validate_allowlist_entry "$value"; then
+        echo "白名单格式无效"
+        return 1
+    fi
+
+    load_allowlist_entries
+    if allowlist_contains_entry "$value"; then
+        echo "该记录已存在"
+        return 0
+    fi
+
+    ALLOWLIST_ENTRIES+=("$value")
+    save_allowlist_entries
+    echo "已添加白名单记录: $value"
+    echo "重新安装后会应用到 HTTP/HTTPS 访问控制"
+}
+
+delete_allowlist_entry() {
+    local index choice i new_entries=()
+    load_allowlist_entries
+
+    if (( ${#ALLOWLIST_ENTRIES[@]} == 0 )); then
+        echo "当前没有可删除的白名单记录"
+        return 0
+    fi
+
+    show_allowlist_entries
+    choice=$(ask "请输入要删除的序号" "")
+    if [[ ! "$choice" =~ ^[0-9]+$ ]]; then
+        echo "序号无效"
+        return 1
+    fi
+
+    index=$((choice - 1))
+    if (( index < 0 || index >= ${#ALLOWLIST_ENTRIES[@]} )); then
+        echo "序号超出范围"
+        return 1
+    fi
+
+    for i in "${!ALLOWLIST_ENTRIES[@]}"; do
+        if (( i != index )); then
+            new_entries+=("${ALLOWLIST_ENTRIES[$i]}")
+        fi
+    done
+
+    echo "已删除白名单记录: ${ALLOWLIST_ENTRIES[$index]}"
+    ALLOWLIST_ENTRIES=("${new_entries[@]}")
+    save_allowlist_entries
+    echo "重新安装后会应用到 HTTP/HTTPS 访问控制"
+}
+
+manage_allowlist_menu() {
+    while :; do
+        show_allowlist_entries
+        echo "白名单管理:"
+        echo "  1) 添加记录"
+        echo "  2) 删除记录"
+        echo "  *) 返回"
+        ACTION=$(ask "请输入选项" "")
+        case "$ACTION" in
+            1) add_allowlist_entry ;;
+            2) delete_allowlist_entry ;;
+            *) break ;;
+        esac
+    done
+}
+
+get_allowlist_csv() {
+    load_allowlist_entries
+    local IFS=,
+    printf '%s' "${ALLOWLIST_ENTRIES[*]:-}"
+}
+
 # ---- 提取当前安装的端口配置 ----
 detect_existing_port() {
     local service_file="$1" proxy_file="$2" port=""
@@ -131,31 +291,47 @@ if [[ -f "$PROXY_JS" || -f "$SERVICE_FILE" ]]; then
     EXISTING_PORT=$(detect_existing_port "$SERVICE_FILE" "$PROXY_JS")
     echo
     echo "检测到 Any Proxy 已安装${EXISTING_PORT:+（当前端口: $EXISTING_PORT）}"
-    echo "请选择操作:"
-    echo "  1) 重新安装"
-    echo "  2) 卸载"
-    echo "  *) 退出"
-    ACTION=$(ask "请输入选项" "")
-    case "$ACTION" in
-        1)
-            echo "准备重新安装..."
-            $SUDO systemctl stop "${SERVICE_NAME}.service" 2>/dev/null || true
-            ;;
-        2)
-            echo "正在卸载 Any Proxy..."
-            $SUDO systemctl stop "${SERVICE_NAME}.service" 2>/dev/null || true
-            $SUDO systemctl disable "${SERVICE_NAME}.service" 2>/dev/null || true
-            $SUDO rm -f "$SERVICE_FILE"
-            $SUDO rm -rf "$INSTALL_DIR"
-            $SUDO systemctl daemon-reload
-            echo "卸载完成"
-            exit 0
-            ;;
-        *)
-            echo "退出脚本"
-            exit 0
-            ;;
-    esac
+    while :; do
+        echo "请选择操作:"
+        echo "  1) 重新安装"
+        echo "  2) 查看白名单"
+        echo "  3) 添加白名单"
+        echo "  4) 删除白名单"
+        echo "  5) 卸载"
+        echo "  *) 退出"
+        ACTION=$(ask "请输入选项" "")
+        case "$ACTION" in
+            1)
+                echo "准备重新安装..."
+                $SUDO systemctl stop "${SERVICE_NAME}.service" 2>/dev/null || true
+                break
+                ;;
+            2)
+                show_allowlist_entries
+                ;;
+            3)
+                add_allowlist_entry
+                ;;
+            4)
+                delete_allowlist_entry
+                ;;
+            5)
+                echo "正在卸载 Any Proxy..."
+                $SUDO systemctl stop "${SERVICE_NAME}.service" 2>/dev/null || true
+                $SUDO systemctl disable "${SERVICE_NAME}.service" 2>/dev/null || true
+                $SUDO rm -f "$SERVICE_FILE"
+                $SUDO rm -rf "$INSTALL_DIR"
+                $SUDO rm -f "$ALLOWLIST_FILE"
+                $SUDO systemctl daemon-reload
+                echo "卸载完成"
+                exit 0
+                ;;
+            *)
+                echo "退出脚本"
+                exit 0
+                ;;
+        esac
+    done
 fi
 
 # ---- 1. 检测/安装/升级 Bun ----
@@ -219,6 +395,13 @@ while :; do
 done
 echo "使用端口: $PORT"
 
+if [[ -z "$EXISTING_PORT" ]]; then
+    CONFIGURE_ALLOWLIST=$(ask "是否现在配置 HTTP/HTTPS 白名单？[y/N]" "N")
+    if [[ "$CONFIGURE_ALLOWLIST" =~ ^[Yy]$ ]]; then
+        manage_allowlist_menu
+    fi
+fi
+
 # ---- 3. 创建工作目录 ----
 echo "创建工作目录: $INSTALL_DIR"
 $SUDO mkdir -p "$INSTALL_DIR"
@@ -231,6 +414,11 @@ $SUDO install -m 755 "$SOURCE_PROXY_JS_RESOLVED" "$PROXY_JS"
 # ---- 5. 创建 systemd 服务 ----
 echo "创建 systemd 服务: $SERVICE_FILE"
 BUN_DIR=$(dirname "$BUN_PATH")
+ALLOWLIST_CSV=$(get_allowlist_csv)
+ALLOWLIST_ENV_LINE=""
+if [[ -n "$ALLOWLIST_CSV" ]]; then
+    ALLOWLIST_ENV_LINE="Environment=IP_ALLOWLIST=$ALLOWLIST_CSV"
+fi
 $SUDO tee "$SERVICE_FILE" >/dev/null <<EOF
 [Unit]
 Description=Any Proxy Service (Bun)
@@ -245,6 +433,7 @@ RestartSec=3
 User=root
 Environment=PATH=$BUN_DIR:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 Environment=PORT=$PORT
+$ALLOWLIST_ENV_LINE
 
 [Install]
 WantedBy=multi-user.target
@@ -276,6 +465,7 @@ Any Proxy 安装完成
   Bun:    $BUN_PATH
   脚本:   $PROXY_JS
   服务:   ${SERVICE_NAME}.service
+  白名单: ${ALLOWLIST_CSV:-（空，默认允许所有 IP）}
 
 使用示例:
   curl 'http://127.0.0.1:$PORT/example.com'                  # 协议可省略，默认 https
