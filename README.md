@@ -16,7 +16,7 @@ A lightweight Bun-based proxy that forwards target addresses via URL path. A sin
 ## Native install (systemd)
 
 ```bash
-bash -c "$(curl -sSL https://raw.githubusercontent.com/tokinx/any-proxy/main/install.sh)"
+curl -sSL https://raw.githubusercontent.com/tokinx/any-proxy/main/install.sh | bash
 # Re-run the same command to manage the allowlist or uninstall
 ```
 
