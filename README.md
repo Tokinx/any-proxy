@@ -1,181 +1,71 @@
 # Any Proxy
 
-基于 Bun 的轻量代理服务，支持 HTTP 转发和 WebSocket 转发，适合快速搭一个“通过路径转发目标地址”的通用代理。
+**English** | [简体中文](README.zh-CN.md)
 
-## 特性
+A lightweight Bun-based proxy that forwards target addresses via URL path. A single process serves both HTTP and WebSocket traffic.
 
-- 通过路径传入目标地址，自动转发请求
-- 目标地址可省略协议，默认补 `https://`
-- 支持 `WebSocket` 升级转发
-- 自动跟随重定向
-- 支持 HTTP/HTTPS 访问白名单，支持单 IP 和 CIDR 网段
-- 同时提供 `systemd` 和 Docker 两种部署方式
-- GitHub Actions 可自动构建并发布 GHCR 镜像
+## Features
 
-## 运行要求
+- Pass the target address in the URL path; the proxy forwards it
+- Protocol is optional — defaults to `https://`
+- Transparent WebSocket upgrade
+- Automatic HTTP redirect following
+- IP / CIDR allowlist (HTTP/HTTPS only)
+- Ships with both systemd and Docker deployment options
 
-### systemd 部署
-
-- Linux
-- `systemd`
-- `root` 权限或 `sudo`
-- `curl`
-- `Bun`
-
-`install.sh` 会在缺失时自动安装 Bun。
-
-### Docker 部署
-
-- Docker Engine 或兼容运行时
-
-## systemd 部署
-
-在仓库根目录执行：
+## Native install (systemd)
 
 ```bash
-bash install.sh
+bash -c "$(curl -sSL https://raw.githubusercontent.com/tokinx/any-proxy/main/install.sh)"
+# Re-run the same command to manage the allowlist or uninstall
 ```
 
-也支持远程一键安装：
+| Action | Command |
+|--------|---------|
+| Service status | `systemctl status any-proxy` |
+| Restart service | `systemctl restart any-proxy` |
+| View logs | `journalctl -u any-proxy -f` |
 
-```bash
-bash -c "$(curl -sSL https://your-url/install.sh)"
-```
+See [docs/install.md](docs/install.md) for details.
 
-如需覆盖默认 `proxy.js` 下载地址：
-
-```bash
-PROXY_JS_URL="https://your-url/proxy.js" bash -c "$(curl -sSL https://your-url/install.sh)"
-```
-
-安装过程会：
-
-- 检测是否已安装，并提供重新安装、卸载、退出选项
-- 已安装场景下支持查看、添加、删除 HTTP/HTTPS 白名单
-- 检测本机 Bun 版本，仅在落后于官方稳定版时提示升级
-- 已安装场景下自动带出现有端口作为默认值
-- 将服务安装到 `systemd` 并设置开机自启
-- 若本地缺少 `proxy.js`，会自动从仓库远程下载
-
-安装目录：
-
-- 代理脚本：`/opt/any-proxy/proxy.js`
-- 服务文件：`/etc/systemd/system/any-proxy.service`
-
-常用命令：
-
-```bash
-systemctl status any-proxy
-systemctl restart any-proxy
-systemctl stop any-proxy
-journalctl -u any-proxy -f
-```
-
-卸载方式：重新运行 `install.sh`，选择“卸载”。
-
-## 白名单控制
-
-- 仅对 HTTP/HTTPS 请求生效
-- WebSocket 请求不受白名单限制
-- 为空时默认允许所有 IP
-- 支持单 IP 和 CIDR，例如 `192.168.1.10`、`192.168.0.0/16`、`10.0.0.0/24`
-
-`systemd` 安装方式下，白名单记录保存在：
-
-```text
-/etc/any-proxy.allowlist
-```
-
-重新运行 `install.sh` 时，可直接查看、添加、删除记录。
-
-## Docker 部署
-
-### 直接构建并运行
-
-```bash
-docker build -t any-proxy:local .
-docker run -d \
-  --name any-proxy \
-  --restart unless-stopped \
-  -e PORT=3000 \
-  -e IP_ALLOWLIST="192.168.1.10,192.168.0.0/16,10.0.0.0/24" \
-  -p 3000:3000 \
-  any-proxy:local
-```
-
-### 使用 Compose
-
-```bash
-docker compose up -d --build
-```
-
-仓库内已提供 [compose.yaml](./compose.yaml)，默认映射 `3000:3000`。
-可通过 `IP_ALLOWLIST` 环境变量传入逗号分隔的白名单，例如：
-
-```yaml
-environment:
-  PORT: 3000
-  IP_ALLOWLIST: "192.168.1.10,192.168.0.0/16,10.0.0.0/24"
-```
-
-### 使用已发布镜像
-
-工作流会将镜像发布到：
-
-```text
-ghcr.io/<owner>/<repo>
-```
-
-示例：
+## Docker
 
 ```bash
 docker run -d \
   --name any-proxy \
-  --restart unless-stopped \
-  -e PORT=3000 \
-  -e IP_ALLOWLIST="192.168.1.10,192.168.0.0/16" \
-  -p 3000:3000 \
-  ghcr.io/<owner>/<repo>:latest
+  --restart always \
+  -p 1080:3000 \
+  ghcr.io/tokinx/any-proxy:latest
 ```
 
-## 使用示例
+See [docs/ci.md](docs/ci.md) for the image build pipeline.
 
-HTTP：
+## Configuration
+
+Configured via environment variables:
+
+| Variable | Description | Default |
+|----------|-------------|---------|
+| `PORT` | Listen port | `3000` |
+| `ALLOWLIST` | Comma-separated IPs or CIDRs; empty means allow all | empty |
+
+`ALLOWLIST` example: `192.168.1.10,192.168.0.0/16,10.0.0.0/24` (IPv4 and IPv6 both supported).
+
+## Examples
+
+HTTP:
 
 ```bash
-curl 'http://127.0.0.1:3000/example.com'
-curl 'http://127.0.0.1:3000/https://example.com/path?q=1'
+curl 'http://127.0.0.1:3000/example.com'                   # protocol optional, defaults to https
+curl 'http://127.0.0.1:3000/https://example.com/path?q=1'  # full URL
 ```
 
-WebSocket：
+WebSocket:
 
 ```js
 new WebSocket('ws://127.0.0.1:3000/echo.websocket.events')
 ```
 
-## 端口配置
+## License
 
-运行端口支持以下环境变量，优先级从高到低：
-
-1. `PORT`
-2. `BUN_PORT`
-3. `NODE_PORT`
-
-未设置时默认使用 `3000`。
-
-白名单环境变量：
-
-- `IP_ALLOWLIST`
-- 逗号分隔多个记录
-- 示例：`IP_ALLOWLIST="192.168.1.10,192.168.0.0/16,10.0.0.0/24"`
-
-## GitHub Actions 镜像构建
-
-仓库已提供 [docker.yml](./.github/workflows/docker.yml)：
-
-- `pull_request`：仅构建镜像，验证 Docker 构建不报错
-- 推送到任意分支：执行构建
-- 推送到默认分支：构建并发布 `latest`
-- 推送 `v*` 标签：构建并发布版本标签
-
-默认发布到 GitHub Container Registry，需要仓库允许 `GITHUB_TOKEN` 写入 packages。
+[MIT](LICENSE)
