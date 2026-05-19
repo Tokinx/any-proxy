@@ -2,7 +2,7 @@
 import { serve } from "bun";
 
 function resolvePort() {
-  const raw = Bun.env.PORT || Bun.env.BUN_PORT || Bun.env.NODE_PORT || "3000";
+  const raw = Bun.env.PORT || "3000";
   const port = Number.parseInt(raw, 10);
 
   if (!Number.isInteger(port) || port < 1 || port > 65535) {
@@ -13,8 +13,7 @@ function resolvePort() {
 }
 
 const PORT = resolvePort();
-const ALLOWLIST_RAW =
-  Bun.env.IP_ALLOWLIST || Bun.env.ALLOWLIST || Bun.env.WHITELIST || "";
+const ALLOWLIST_RAW = Bun.env.ALLOWLIST || "";
 
 function normalizeIpLiteral(input) {
   let ip = String(input || "").trim().toLowerCase();

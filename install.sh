@@ -459,7 +459,7 @@ BUN_DIR=$(dirname "$BUN_PATH")
 ALLOWLIST_CSV=$(get_allowlist_csv)
 ALLOWLIST_ENV_LINE=""
 if [[ -n "$ALLOWLIST_CSV" ]]; then
-    ALLOWLIST_ENV_LINE="Environment=IP_ALLOWLIST=$ALLOWLIST_CSV"
+    ALLOWLIST_ENV_LINE="Environment=ALLOWLIST=$ALLOWLIST_CSV"
 fi
 $SUDO tee "$SERVICE_FILE" >/dev/null <<EOF
 [Unit]
