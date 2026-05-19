@@ -10,7 +10,7 @@
 - 目标地址可省略协议，默认补 `https://`
 - WebSocket 升级自动透传
 - 自动跟随 HTTP 重定向
-- 支持 IP / CIDR 白名单（仅作用于 HTTP/HTTPS）
+- 支持 IP / CIDR 白名单；HTTP/HTTPS 校验来源 IP，WebSocket 校验双端任一命中
 - 提供 systemd 与 Docker 两种部署方式
 
 ## 原生安装
@@ -50,8 +50,14 @@ docker run -d \
 |------|------|--------|
 | `PORT` | 监听端口 | `3000` |
 | `ALLOWLIST` | 逗号分隔的 IP 或 CIDR 白名单，留空表示允许全部 | 空 |
+| `WS_QUEUE_LIMIT_BYTES` | 下游 WebSocket 未就绪前允许缓冲的最大字节数 | `1048576` |
 
 `ALLOWLIST` 示例：`192.168.1.10,192.168.0.0/16,10.0.0.0/24`，同时支持 IPv4 与 IPv6。
+
+白名单策略：
+
+- HTTP/HTTPS 仅校验客户端来源 IP。
+- WebSocket 只要客户端来源 IP 或下游目标 IP 任一命中白名单，即允许建立连接。
 
 ## 使用示例
 

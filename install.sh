@@ -11,7 +11,8 @@ SERVICE_NAME="any-proxy"
 SERVICE_FILE="/etc/systemd/system/${SERVICE_NAME}.service"
 ALLOWLIST_FILE="/etc/any-proxy.allowlist"
 DEFAULT_PORT=3000
-PROXY_JS_URL="${PROXY_JS_URL:-https://raw.githubusercontent.com/tokinx/any-proxy/refs/heads/main/install.sh}"
+DEFAULT_WS_QUEUE_LIMIT_BYTES=1048576
+PROXY_JS_URL="${PROXY_JS_URL:-https://raw.githubusercontent.com/tokinx/any-proxy/refs/heads/main/proxy.js}"
 SCRIPT_SOURCE="${BASH_SOURCE[0]:-$0}"
 SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$SCRIPT_SOURCE")" 2>/dev/null && pwd || pwd)
 SOURCE_PROXY_JS="$SCRIPT_DIR/proxy.js"
@@ -139,9 +140,10 @@ normalize_allowlist_entry() {
 }
 
 validate_allowlist_entry() {
-    local value="$1" ip prefix octet
+    local value="$1" ip prefix octet address zone
     [[ -n "$value" ]] || return 1
     [[ "$value" != *,* ]] || return 1
+    [[ "$value" != *[[:space:]]* ]] || return 1
 
     if [[ "$value" =~ ^(([0-9]{1,3}\.){3}[0-9]{1,3})(/([0-9]|[12][0-9]|3[0-2]))?$ ]]; then
         IFS='/' read -r ip prefix <<<"$value"
@@ -153,12 +155,29 @@ validate_allowlist_entry() {
         return 0
     fi
 
-    if [[ "$value" =~ : ]]; then
-        [[ "$value" =~ ^[0-9a-f:/.\[\]]+$ ]] || return 1
+    if [[ "$value" == *:* ]]; then
+        address="$value"
         if [[ "$value" == */* ]]; then
+            address="${value%/*}"
             prefix=${value##*/}
             [[ "$prefix" =~ ^([0-9]|[1-9][0-9]|1[01][0-9]|12[0-8])$ ]] || return 1
         fi
+
+        if [[ "$address" == *%* ]]; then
+            zone="${address#*%}"
+            address="${address%%%*}"
+            [[ -n "$zone" ]] || return 1
+            [[ "$zone" != *[![:alnum:]_.-]* ]] || return 1
+        fi
+
+        if [[ "$address" == \[*\] ]]; then
+            address="${address#[}"
+            address="${address%]}"
+        fi
+
+        [[ -n "$address" ]] || return 1
+        [[ "$address" == *:* ]] || return 1
+        [[ "$address" != *[![:xdigit:]:.]* ]] || return 1
         return 0
     fi
 
@@ -203,7 +222,7 @@ show_allowlist_entries() {
     local i
     load_allowlist_entries
     echo
-    echo "$(t "Current HTTP/HTTPS allowlist:" "当前 HTTP/HTTPS 白名单:")"
+    echo "$(t "Current access allowlist:" "当前访问白名单:")"
     if (( ${#ALLOWLIST_ENTRIES[@]} == 0 )); then
         echo "$(t "  (empty — all IPs allowed by default)" "  （空，默认允许所有 IP）")"
         return 0
@@ -234,8 +253,8 @@ add_allowlist_entry() {
     ALLOWLIST_ENTRIES+=("$value")
     save_allowlist_entries
     echo "$(t "Added: $value" "已添加白名单记录: $value")"
-    echo "$(t "Re-run the installer to apply it to HTTP/HTTPS access control" \
-              "重新安装后会应用到 HTTP/HTTPS 访问控制")"
+    echo "$(t "Re-run the installer to apply it to runtime access control" \
+              "重新安装后会应用到运行时访问控制")"
 }
 
 delete_allowlist_entry() {
@@ -269,8 +288,8 @@ delete_allowlist_entry() {
     echo "$(t "Removed: ${ALLOWLIST_ENTRIES[$index]}" "已删除白名单记录: ${ALLOWLIST_ENTRIES[$index]}")"
     ALLOWLIST_ENTRIES=("${new_entries[@]}")
     save_allowlist_entries
-    echo "$(t "Re-run the installer to apply it to HTTP/HTTPS access control" \
-              "重新安装后会应用到 HTTP/HTTPS 访问控制")"
+    echo "$(t "Re-run the installer to apply it to runtime access control" \
+              "重新安装后会应用到运行时访问控制")"
 }
 
 manage_allowlist_menu() {
@@ -318,8 +337,13 @@ echo "============================="
 
 # ---- Detect existing install: prompt for reinstall/uninstall/exit ----
 EXISTING_PORT=""
+EXISTING_WS_QUEUE_LIMIT=""
 if [[ -f "$PROXY_JS" || -f "$SERVICE_FILE" ]]; then
     EXISTING_PORT=$(detect_existing_port "$SERVICE_FILE" "$PROXY_JS")
+    if [[ -f "$SERVICE_FILE" ]]; then
+        EXISTING_WS_QUEUE_LIMIT=$(grep -oE '^Environment=WS_QUEUE_LIMIT_BYTES=[0-9]+' "$SERVICE_FILE" 2>/dev/null \
+            | head -1 | grep -oE '[0-9]+' || true)
+    fi
     echo
     if [[ -n "$EXISTING_PORT" ]]; then
         echo "$(t "Any Proxy is already installed (current port: $EXISTING_PORT)" \
@@ -437,8 +461,8 @@ done
 echo "$(t "Using port: $PORT" "使用端口: $PORT")"
 
 if [[ -z "$EXISTING_PORT" ]]; then
-    CONFIGURE_ALLOWLIST=$(ask "$(t "Configure the HTTP/HTTPS allowlist now? [y/N]" \
-                                    "是否现在配置 HTTP/HTTPS 白名单？[y/N]")" "N")
+    CONFIGURE_ALLOWLIST=$(ask "$(t "Configure the runtime allowlist now? [y/N]" \
+                                    "是否现在配置运行时白名单？[y/N]")" "N")
     if [[ "$CONFIGURE_ALLOWLIST" =~ ^[Yy]$ ]]; then
         manage_allowlist_menu
     fi
@@ -458,8 +482,20 @@ echo "$(t "Creating systemd unit: $SERVICE_FILE" "创建 systemd 服务: $SERVIC
 BUN_DIR=$(dirname "$BUN_PATH")
 ALLOWLIST_CSV=$(get_allowlist_csv)
 ALLOWLIST_ENV_LINE=""
+WS_QUEUE_LIMIT_VALUE="${WS_QUEUE_LIMIT_BYTES:-$EXISTING_WS_QUEUE_LIMIT}"
+WS_QUEUE_LIMIT_ENV_LINE=""
 if [[ -n "$ALLOWLIST_CSV" ]]; then
     ALLOWLIST_ENV_LINE="Environment=ALLOWLIST=$ALLOWLIST_CSV"
+fi
+if [[ -n "$WS_QUEUE_LIMIT_VALUE" ]]; then
+    if [[ ! "$WS_QUEUE_LIMIT_VALUE" =~ ^[1-9][0-9]*$ ]]; then
+        echo "$(t "Invalid WS_QUEUE_LIMIT_BYTES (must be a positive integer)" \
+                  "WS_QUEUE_LIMIT_BYTES 无效（必须为正整数）")" >&2
+        exit 1
+    fi
+    WS_QUEUE_LIMIT_ENV_LINE="Environment=WS_QUEUE_LIMIT_BYTES=$WS_QUEUE_LIMIT_VALUE"
+else
+    WS_QUEUE_LIMIT_VALUE="$DEFAULT_WS_QUEUE_LIMIT_BYTES"
 fi
 $SUDO tee "$SERVICE_FILE" >/dev/null <<EOF
 [Unit]
@@ -476,6 +512,7 @@ User=root
 Environment=PATH=$BUN_DIR:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 Environment=PORT=$PORT
 $ALLOWLIST_ENV_LINE
+$WS_QUEUE_LIMIT_ENV_LINE
 
 [Install]
 WantedBy=multi-user.target
@@ -506,11 +543,12 @@ cat <<EOF
 
 Any Proxy 安装完成
 
-  端口:    $PORT
-  Bun:     $BUN_PATH
-  脚本:    $PROXY_JS
-  服务:    ${SERVICE_NAME}.service
-  白名单:  $ALLOWLIST_DISPLAY
+  端口:         $PORT
+  Bun:          $BUN_PATH
+  脚本:         $PROXY_JS
+  服务:         ${SERVICE_NAME}.service
+  白名单:       $ALLOWLIST_DISPLAY
+  WS 队列上限:  $WS_QUEUE_LIMIT_VALUE bytes
 
 使用示例:
   curl 'http://127.0.0.1:$PORT/example.com'                       # 协议可省略，默认 https
@@ -530,11 +568,12 @@ cat <<EOF
 
 Any Proxy installation complete
 
-  Port:      $PORT
-  Bun:       $BUN_PATH
-  Script:    $PROXY_JS
-  Service:   ${SERVICE_NAME}.service
-  Allowlist: $ALLOWLIST_DISPLAY
+  Port:            $PORT
+  Bun:             $BUN_PATH
+  Script:          $PROXY_JS
+  Service:         ${SERVICE_NAME}.service
+  Allowlist:       $ALLOWLIST_DISPLAY
+  WS queue limit:  $WS_QUEUE_LIMIT_VALUE bytes
 
 Examples:
   curl 'http://127.0.0.1:$PORT/example.com'                       # protocol optional, defaults to https

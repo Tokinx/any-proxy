@@ -17,7 +17,7 @@
 1. 检测是否已安装；已安装则进入管理菜单（重装、查看/添加/删除白名单、卸载）
 2. 检测 Bun，缺失则自动安装；存在但落后于官方稳定版时提示升级
 3. 询问端口（已安装则带出现有端口为默认值）
-4. 首次安装时可选配置 HTTP/HTTPS 白名单
+4. 首次安装时可选配置运行时白名单
 5. 写入 `proxy.js`、生成 systemd unit、enable + restart 服务
 
 若本地没有 `proxy.js`，脚本会从 `PROXY_JS_URL` 下载，默认指向上游仓库。fork 后如需指向自己的版本：
@@ -45,12 +45,23 @@ bash install.sh --lang=zh-CN
 
 ## 白名单管理
 
-- 仅作用于 HTTP/HTTPS 请求，WebSocket 升级不受限制
 - 列表为空时默认允许所有 IP
 - 支持单 IP 和 CIDR，如 `192.168.1.10`、`192.168.0.0/16`、`10.0.0.0/24`，IPv4/IPv6 均可
 - 记录保存在 `/etc/any-proxy.allowlist`，重新运行 `install.sh` 可交互式增删
+- HTTP/HTTPS 仅校验客户端来源 IP
+- WebSocket 只要客户端来源 IP 或下游目标 IP 任一命中白名单，即允许建立连接
 
 修改白名单后会写回文件，但需要**重新运行 `install.sh`**（或手动重启服务）才能让新的 `ALLOWLIST` 环境变量被 systemd 加载生效。
+
+## WebSocket 队列上限
+
+`WS_QUEUE_LIMIT_BYTES` 用于控制下游 WebSocket 建立前，允许缓冲的最大字节数。运行时默认值为 `1048576` 字节。
+
+systemd 安装时，如需持久化该值，可在运行安装脚本前导出环境变量：
+
+```bash
+WS_QUEUE_LIMIT_BYTES=2097152 bash install.sh
+```
 
 ## 卸载
 

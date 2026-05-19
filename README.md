@@ -10,7 +10,7 @@ A lightweight Bun-based proxy that forwards target addresses via URL path. A sin
 - Protocol is optional — defaults to `https://`
 - Transparent WebSocket upgrade
 - Automatic HTTP redirect following
-- IP / CIDR allowlist (HTTP/HTTPS only)
+- IP / CIDR allowlist for HTTP/HTTPS, plus either-peer matching for WebSocket
 - Ships with both systemd and Docker deployment options
 
 ## Native install (systemd)
@@ -50,8 +50,14 @@ Configured via environment variables:
 |----------|-------------|---------|
 | `PORT` | Listen port | `3000` |
 | `ALLOWLIST` | Comma-separated IPs or CIDRs; empty means allow all | empty |
+| `WS_QUEUE_LIMIT_BYTES` | Max buffered bytes before downstream WebSocket is ready | `1048576` |
 
 `ALLOWLIST` example: `192.168.1.10,192.168.0.0/16,10.0.0.0/24` (IPv4 and IPv6 both supported).
+
+Allowlist behavior:
+
+- HTTP/HTTPS checks the client source IP only.
+- WebSocket allows the connection when either the client source IP or the downstream target IP resolves into the allowlist.
 
 ## Examples
 

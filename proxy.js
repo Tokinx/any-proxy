@@ -1,8 +1,13 @@
 #!/usr/bin/env bun
 import { serve } from "bun";
+import { Buffer } from "node:buffer";
+import { lookup as defaultDnsLookup } from "node:dns/promises";
 
-function resolvePort() {
-  const raw = Bun.env.PORT || "3000";
+export const DEFAULT_PORT = 3000;
+export const DEFAULT_WS_QUEUE_LIMIT_BYTES = 1024 * 1024;
+
+export function resolvePort(env = Bun.env) {
+  const raw = env.PORT || String(DEFAULT_PORT);
   const port = Number.parseInt(raw, 10);
 
   if (!Number.isInteger(port) || port < 1 || port > 65535) {
@@ -12,10 +17,18 @@ function resolvePort() {
   return port;
 }
 
-const PORT = resolvePort();
-const ALLOWLIST_RAW = Bun.env.ALLOWLIST || "";
+export function resolveWsQueueLimitBytes(env = Bun.env) {
+  const raw = env.WS_QUEUE_LIMIT_BYTES || String(DEFAULT_WS_QUEUE_LIMIT_BYTES);
+  const limit = Number.parseInt(raw, 10);
 
-function normalizeIpLiteral(input) {
+  if (!Number.isInteger(limit) || limit < 1) {
+    throw new Error(`Invalid WS_QUEUE_LIMIT_BYTES: ${raw}`);
+  }
+
+  return limit;
+}
+
+export function normalizeIpLiteral(input) {
   let ip = String(input || "").trim().toLowerCase();
   if (!ip) return "";
   if (ip.startsWith("[") && ip.endsWith("]")) {
@@ -24,7 +37,7 @@ function normalizeIpLiteral(input) {
   return ip.replace(/%.+$/, "");
 }
 
-function parseIpv4(ip) {
+export function parseIpv4(ip) {
   const parts = ip.split(".");
   if (parts.length !== 4) return null;
 
@@ -39,7 +52,7 @@ function parseIpv4(ip) {
   return { version: 4, bits: 32, value };
 }
 
-function parseIpv6(ip) {
+export function parseIpv6(ip) {
   if (!ip.includes(":")) return null;
   if (ip.indexOf("::") !== ip.lastIndexOf("::")) return null;
 
@@ -96,7 +109,7 @@ function parseIpv6(ip) {
   return { version: 6, bits: 128, value };
 }
 
-function parseIpAddress(ip) {
+export function parseIpAddress(ip) {
   const normalized = normalizeIpLiteral(ip);
   if (!normalized) return null;
   if (normalized.startsWith("::ffff:") && normalized.includes(".")) {
@@ -105,13 +118,13 @@ function parseIpAddress(ip) {
   return parseIpv4(normalized) || parseIpv6(normalized);
 }
 
-function maskForPrefix(bits, prefix) {
+export function maskForPrefix(bits, prefix) {
   if (prefix <= 0) return 0n;
   if (prefix >= bits) return (1n << BigInt(bits)) - 1n;
   return ((1n << BigInt(prefix)) - 1n) << BigInt(bits - prefix);
 }
 
-function compileAllowlist(raw) {
+export function compileAllowlist(raw) {
   const rules = [];
   const seen = new Set();
 
@@ -146,26 +159,24 @@ function compileAllowlist(raw) {
   return rules;
 }
 
-function matchesAllowlist(address, rule) {
+export function matchesAllowlist(address, rule) {
   const parsed = parseIpAddress(address);
   if (!parsed || parsed.version !== rule.version) return false;
   return (parsed.value & rule.mask) === rule.network;
 }
 
-function isAllowedClientIp(address) {
-  if (!ALLOWLIST.length) return true;
+export function isAllowedAddress(address, allowlist) {
+  if (!allowlist.length) return true;
   if (!address) return false;
-  return ALLOWLIST.some((rule) => matchesAllowlist(address, rule));
+  return allowlist.some((rule) => matchesAllowlist(address, rule));
 }
-
-const ALLOWLIST = compileAllowlist(ALLOWLIST_RAW);
 
 // Strip the downstream target URL from this proxy's own request URL,
 // fixing protocol completion / normalization edge cases:
 //   http://host:PORT/https://example.com/p  -> https://example.com/p
 //   http://host:PORT/example.com/p          -> https://example.com/p   (default to https://)
 //   http://host:PORT/https:/example.com/p   -> https://example.com/p   (restore single-slash normalization)
-function extractTarget(raw) {
+export function extractTarget(raw) {
   let path;
   const protoEnd = raw.indexOf("://");
   if (protoEnd >= 0) {
@@ -176,216 +187,359 @@ function extractTarget(raw) {
   }
   path = path.replace(/^\/+/, "");
   if (!path) return "";
-  // Restore single-slash forms like https:/ or wss:/ produced by URL normalization
   path = path.replace(/^(wss?|https?):\/+/i, "$1://");
-  // Default to https:// when no protocol is present (WS upgrade re-maps to wss:// later)
   if (!/^(wss?|https?):\/\//i.test(path)) {
     path = "https://" + path;
   }
   return path;
 }
 
-// Map HTTP(S) -> WS(S); leave ws/wss as-is
-function toWsUrl(url) {
+export function toWsUrl(url) {
   if (/^wss?:\/\//i.test(url)) return url;
-  return url.replace(/^https?:\/\//i, (m) =>
-    /^https/i.test(m) ? "wss://" : "ws://",
+  return url.replace(/^https?:\/\//i, (match) =>
+    /^https/i.test(match) ? "wss://" : "ws://",
   );
 }
 
-// 1005/1006 are reserved close codes and cannot be passed to close() directly
-function safeCloseCode(code) {
+export function safeCloseCode(code) {
   if (!code || code === 1005 || code === 1006) return 1000;
   return code;
 }
 
-// Hop-by-hop / WS-internal headers — strip when forwarding to the downstream
-function shouldStripHeader(name) {
-  const n = name.toLowerCase();
+export function shouldStripHeader(name) {
+  const normalized = name.toLowerCase();
   return (
-    n === "host" ||
-    n === "connection" ||
-    n === "upgrade" ||
-    n === "content-length" ||
-    n.startsWith("sec-websocket-")
+    normalized === "host" ||
+    normalized === "connection" ||
+    normalized === "upgrade" ||
+    normalized === "content-length" ||
+    normalized.startsWith("sec-websocket-")
   );
 }
 
-serve({
-  port: PORT,
+export function buildForwardHeaders(req) {
+  const forwardHeaders = {};
+  for (const [key, value] of req.headers) {
+    if (!shouldStripHeader(key)) forwardHeaders[key] = value;
+  }
+  return forwardHeaders;
+}
 
-  async fetch(req, srv) {
-    try {
-      const isWebSocket = req.headers.get("upgrade")?.toLowerCase() === "websocket";
-      if (!isWebSocket && !isAllowedClientIp(srv?.requestIP?.(req)?.address || "")) {
-        return new Response("Forbidden", { status: 403 });
-      }
+export function createRuntimeConfig(env = Bun.env) {
+  return {
+    port: resolvePort(env),
+    allowlistRaw: env.ALLOWLIST || "",
+    allowlist: compileAllowlist(env.ALLOWLIST || ""),
+    wsQueueLimitBytes: resolveWsQueueLimitBytes(env),
+  };
+}
 
-      // ==== WebSocket upgrade: handshake synchronously, connect downstream lazily in the open hook ====
-      if (isWebSocket) {
-        const httpTarget = extractTarget(req.url);
-        if (!httpTarget) {
-          return new Response("Missing target URL", { status: 400 });
-        }
-        const wsTarget = toWsUrl(httpTarget);
+export function getRequestClientAddress(server, req) {
+  return server?.requestIP?.(req)?.address || "";
+}
 
-        const clientProtocols = (req.headers.get("sec-websocket-protocol") || "")
-          .split(",")
-          .map((s) => s.trim())
-          .filter(Boolean);
+export function getTargetHostname(targetUrl) {
+  try {
+    return normalizeIpLiteral(new URL(targetUrl).hostname);
+  } catch {
+    return "";
+  }
+}
 
-        const fwdHeaders = {};
-        for (const [k, v] of req.headers) {
-          if (!shouldStripHeader(k)) fwdHeaders[k] = v;
-        }
+export async function resolveTargetAddresses(
+  targetUrl,
+  dnsLookup = defaultDnsLookup,
+  logger = null,
+) {
+  const hostname = getTargetHostname(targetUrl);
+  if (!hostname) return [];
 
-        // Subprotocol must be answered during the handshake; echo the first one the client asked for.
-        // If the downstream disagrees, it will close the connection on its own — the loop closes cleanly.
-        const upgradeOpts = {
-          data: {
-            wsTarget,
-            clientProtocols,
-            fwdHeaders,
-            queue: [],
-            ready: false,
-            downstream: null,
-          },
-        };
-        if (clientProtocols.length) {
-          // Bun requires headers to be a Headers instance or a non-empty object; an empty object fails validation
-          const h = new Headers();
-          h.set("sec-websocket-protocol", clientProtocols[0]);
-          upgradeOpts.headers = h;
-        }
+  if (parseIpAddress(hostname)) {
+    return [hostname];
+  }
 
-        const upgraded = srv.upgrade(req, upgradeOpts);
+  try {
+    const records = await dnsLookup(hostname, { all: true, verbatim: true });
+    return [...new Set(records.map(({ address }) => normalizeIpLiteral(address)).filter(Boolean))];
+  } catch (error) {
+    logger?.error?.("[ws] target lookup failed:", error?.message || error, "host=", hostname);
+    return [];
+  }
+}
 
-        if (!upgraded) {
-          console.error("[ws] upgrade rejected:", wsTarget);
-          return new Response("Upgrade rejected", { status: 500 });
-        }
-        return undefined;
-      }
+export async function isAllowedWebSocketPeer({
+  clientAddress,
+  targetUrl,
+  allowlist,
+  dnsLookup = defaultDnsLookup,
+  logger = null,
+}) {
+  if (!allowlist.length) return true;
+  if (isAllowedAddress(clientAddress, allowlist)) return true;
 
-      // ==== Plain HTTP forward ====
-      const target = extractTarget(req.url);
+  const targetAddresses = await resolveTargetAddresses(targetUrl, dnsLookup, logger);
+  return targetAddresses.some((address) => isAllowedAddress(address, allowlist));
+}
 
-      if (!target) {
-        const origin = new URL(req.url).origin;
-        return new Response(
-          "Usage: " + origin + "/<target-url>\n" +
-          "Protocol is optional and defaults to https; WebSocket is detected via the Upgrade header.\n" +
-          "Examples:\n" +
-          "  " + origin + "/example.com\n" +
-          "  " + origin + "/https://example.com/path?q=1\n" +
-          "  new WebSocket('ws://host:PORT/example.com/socket')\n",
-          { status: 400, headers: { "content-type": "text/plain; charset=utf-8" } },
-        );
-      }
+export function getMessageSize(message) {
+  if (typeof message === "string") {
+    return Buffer.byteLength(message);
+  }
 
-      const reqHeaders = new Headers(req.headers);
-      reqHeaders.delete("host");
+  if (message instanceof ArrayBuffer) {
+    return message.byteLength;
+  }
 
-      const resp = await fetch(target, {
-        method: req.method,
-        headers: reqHeaders,
-        body: ["GET", "HEAD"].includes(req.method) ? undefined : req.body,
-        // Auto-follow redirects: required for multi-hop targets like GitHub Releases.
-        // Otherwise the client gets a 302, the follow-up does not go through the proxy,
-        // and some clients hang waiting for a body.
-        redirect: "follow",
-      });
+  if (ArrayBuffer.isView(message)) {
+    return message.byteLength;
+  }
 
-      const respHeaders = new Headers(resp.headers);
-      respHeaders.delete("content-encoding");
-      respHeaders.delete("content-length");
+  if (typeof Blob !== "undefined" && message instanceof Blob) {
+    return message.size;
+  }
 
-      return new Response(resp.body, {
-        status: resp.status,
-        statusText: resp.statusText,
-        headers: respHeaders,
-      });
-    } catch (err) {
-      console.error("[fetch error]", err?.stack || err);
-      return new Response("Error: " + (err?.message || String(err)), { status: 500 });
-    }
-  },
+  return Buffer.byteLength(String(message));
+}
 
-  websocket: {
-    // Long-connection friendly: 5-minute idle timeout, sendPings keeps the link alive across the common 5-min NAT timeout
-    idleTimeout: 300,
-    sendPings: true,
+export function clearPendingMessages(state) {
+  state.queue.length = 0;
+  state.queueBytes = 0;
+}
 
-    open(ws) {
-      const { wsTarget, clientProtocols, fwdHeaders } = ws.data;
+export function enqueuePendingMessage(state, message) {
+  const nextSize = state.queueBytes + getMessageSize(message);
+  if (nextSize > state.queueLimitBytes) {
+    return false;
+  }
 
-      let downstream;
+  state.queue.push(message);
+  state.queueBytes = nextSize;
+  return true;
+}
+
+export function createProxyServerOptions({
+  env = Bun.env,
+  fetchImpl = fetch,
+  WebSocketCtor = WebSocket,
+  dnsLookup = defaultDnsLookup,
+  logger = console,
+} = {}) {
+  const config = createRuntimeConfig(env);
+
+  return {
+    port: config.port,
+
+    async fetch(req, srv) {
       try {
-        // Bun client WebSocket:
-        // - when headers are present, use the Bun-extended options object
-        // - protocols only -> use the standard positional argument
-        const hasHeaders = Object.keys(fwdHeaders).length > 0;
-        if (hasHeaders) {
-          const opts = { headers: fwdHeaders };
-          if (clientProtocols.length) opts.protocols = clientProtocols;
-          downstream = new WebSocket(wsTarget, opts);
-        } else if (clientProtocols.length) {
-          downstream = new WebSocket(wsTarget, clientProtocols);
-        } else {
-          downstream = new WebSocket(wsTarget);
+        const isWebSocket = req.headers.get("upgrade")?.toLowerCase() === "websocket";
+        const clientAddress = getRequestClientAddress(srv, req);
+
+        if (!isWebSocket && !isAllowedAddress(clientAddress, config.allowlist)) {
+          return new Response("Forbidden", { status: 403 });
         }
-        downstream.binaryType = "arraybuffer";
-      } catch (e) {
-        console.error("[ws] downstream init failed:", e?.message || e, "url=", wsTarget);
-        try { ws.close(1011, "downstream init failed"); } catch {}
-        return;
-      }
 
-      ws.data.downstream = downstream;
-      console.log("[ws] connecting downstream:", wsTarget);
+        if (isWebSocket) {
+          const httpTarget = extractTarget(req.url);
+          if (!httpTarget) {
+            return new Response("Missing target URL", { status: 400 });
+          }
 
-      downstream.addEventListener("open", () => {
-        ws.data.ready = true;
-        const q = ws.data.queue;
-        for (const m of q) {
-          try { downstream.send(m); } catch {}
+          const allowed = await isAllowedWebSocketPeer({
+            clientAddress,
+            targetUrl: httpTarget,
+            allowlist: config.allowlist,
+            dnsLookup,
+            logger,
+          });
+          if (!allowed) {
+            logger.error?.(
+              "[ws] allowlist denied:",
+              `client=${clientAddress || "unknown"}`,
+              `target=${httpTarget}`,
+            );
+            return new Response("Forbidden", { status: 403 });
+          }
+
+          const wsTarget = toWsUrl(httpTarget);
+          const clientProtocols = (req.headers.get("sec-websocket-protocol") || "")
+            .split(",")
+            .map((value) => value.trim())
+            .filter(Boolean);
+
+          const upgradeOptions = {
+            data: {
+              wsTarget,
+              clientProtocols,
+              fwdHeaders: buildForwardHeaders(req),
+              queue: [],
+              queueBytes: 0,
+              queueLimitBytes: config.wsQueueLimitBytes,
+              ready: false,
+              downstream: null,
+            },
+          };
+
+          if (clientProtocols.length) {
+            const headers = new Headers();
+            headers.set("sec-websocket-protocol", clientProtocols[0]);
+            upgradeOptions.headers = headers;
+          }
+
+          const upgraded = srv.upgrade(req, upgradeOptions);
+          if (!upgraded) {
+            logger.error?.("[ws] upgrade rejected:", wsTarget);
+            return new Response("Upgrade rejected", { status: 500 });
+          }
+
+          return undefined;
         }
-        q.length = 0;
-        console.log("[ws] downstream open:", wsTarget);
-      });
 
-      downstream.addEventListener("message", (e) => {
-        try { ws.send(e.data); } catch {}
-      });
+        const target = extractTarget(req.url);
+        if (!target) {
+          const origin = new URL(req.url).origin;
+          return new Response(
+            "Usage: " + origin + "/<target-url>\n" +
+            "Protocol is optional and defaults to https; WebSocket is detected via the Upgrade header.\n" +
+            "Examples:\n" +
+            "  " + origin + "/example.com\n" +
+            "  " + origin + "/https://example.com/path?q=1\n" +
+            "  new WebSocket('ws://host:PORT/example.com/socket')\n",
+            { status: 400, headers: { "content-type": "text/plain; charset=utf-8" } },
+          );
+        }
 
-      downstream.addEventListener("close", (e) => {
-        try { ws.close(safeCloseCode(e.code), e.reason || ""); } catch {}
-      });
+        const reqHeaders = new Headers(req.headers);
+        reqHeaders.delete("host");
 
-      downstream.addEventListener("error", (e) => {
-        console.error("[ws] downstream error:", e?.message || e?.type || "unknown");
-        try { ws.close(1011, "downstream error"); } catch {}
-      });
+        const resp = await fetchImpl(target, {
+          method: req.method,
+          headers: reqHeaders,
+          body: ["GET", "HEAD"].includes(req.method) ? undefined : req.body,
+          redirect: "follow",
+        });
+
+        const respHeaders = new Headers(resp.headers);
+        respHeaders.delete("content-encoding");
+        respHeaders.delete("content-length");
+
+        return new Response(resp.body, {
+          status: resp.status,
+          statusText: resp.statusText,
+          headers: respHeaders,
+        });
+      } catch (err) {
+        logger.error?.("[fetch error]", err?.stack || err);
+        return new Response("Error: " + (err?.message || String(err)), { status: 500 });
+      }
     },
 
-    message(ws, msg) {
-      const ds = ws.data.downstream;
-      if (!ws.data.ready || !ds || ds.readyState !== 1) {
-        ws.data.queue.push(msg);
-        return;
-      }
-      try { ds.send(msg); } catch (e) {
-        console.error("[ws] send to downstream failed:", e?.message || e);
-      }
-    },
+    websocket: {
+      idleTimeout: 300,
+      sendPings: true,
 
-    close(ws, code, reason) {
-      const ds = ws.data.downstream;
-      if (ds) {
-        try { ds.close(safeCloseCode(code), reason || ""); } catch {}
-      }
-    },
-  },
-});
+      open(ws) {
+        const { wsTarget, clientProtocols, fwdHeaders } = ws.data;
 
-console.log("Any Proxy running on port " + PORT + " (HTTP + WebSocket)");
+        let downstream;
+        try {
+          const hasHeaders = Object.keys(fwdHeaders).length > 0;
+          if (hasHeaders) {
+            const options = { headers: fwdHeaders };
+            if (clientProtocols.length) options.protocols = clientProtocols;
+            downstream = new WebSocketCtor(wsTarget, options);
+          } else if (clientProtocols.length) {
+            downstream = new WebSocketCtor(wsTarget, clientProtocols);
+          } else {
+            downstream = new WebSocketCtor(wsTarget);
+          }
+          downstream.binaryType = "arraybuffer";
+        } catch (error) {
+          logger.error?.("[ws] downstream init failed:", error?.message || error, "url=", wsTarget);
+          try {
+            ws.close(1011, "downstream init failed");
+          } catch {}
+          return;
+        }
+
+        ws.data.downstream = downstream;
+        logger.log?.("[ws] connecting downstream:", wsTarget);
+
+        downstream.addEventListener("open", () => {
+          ws.data.ready = true;
+          for (const message of ws.data.queue) {
+            try {
+              downstream.send(message);
+            } catch {}
+          }
+          clearPendingMessages(ws.data);
+          logger.log?.("[ws] downstream open:", wsTarget);
+        });
+
+        downstream.addEventListener("message", (event) => {
+          try {
+            ws.send(event.data);
+          } catch {}
+        });
+
+        downstream.addEventListener("close", (event) => {
+          clearPendingMessages(ws.data);
+          try {
+            ws.close(safeCloseCode(event.code), event.reason || "");
+          } catch {}
+        });
+
+        downstream.addEventListener("error", (event) => {
+          logger.error?.("[ws] downstream error:", event?.message || event?.type || "unknown");
+          clearPendingMessages(ws.data);
+          try {
+            ws.close(1011, "downstream error");
+          } catch {}
+        });
+      },
+
+      message(ws, message) {
+        const downstream = ws.data.downstream;
+        if (!ws.data.ready || !downstream || downstream.readyState !== 1) {
+          if (!enqueuePendingMessage(ws.data, message)) {
+            logger.error?.("[ws] queue limit exceeded:", ws.data.queueLimitBytes, "url=", ws.data.wsTarget);
+            clearPendingMessages(ws.data);
+            if (downstream && downstream.readyState < 2) {
+              try {
+                downstream.close(1013, "queue limit exceeded");
+              } catch {}
+            }
+            try {
+              ws.close(1013, "queue limit exceeded");
+            } catch {}
+          }
+          return;
+        }
+
+        try {
+          downstream.send(message);
+        } catch (error) {
+          logger.error?.("[ws] send to downstream failed:", error?.message || error);
+        }
+      },
+
+      close(ws, code, reason) {
+        clearPendingMessages(ws.data);
+        const downstream = ws.data.downstream;
+        if (downstream) {
+          try {
+            downstream.close(safeCloseCode(code), reason || "");
+          } catch {}
+        }
+      },
+    },
+  };
+}
+
+export function createProxyServer(options = {}) {
+  return serve(createProxyServerOptions(options));
+}
+
+if (import.meta.main) {
+  const server = createProxyServer();
+  console.log("Any Proxy running on port " + server.port + " (HTTP + WebSocket)");
+}

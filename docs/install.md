@@ -17,7 +17,7 @@
 1. Detect whether Any Proxy is already installed; if so, enter the management menu (reinstall, list/add/remove allowlist entries, uninstall).
 2. Detect Bun; install it if missing, prompt for upgrade if older than the latest stable release.
 3. Ask for the listen port (defaults to the existing port on reinstall).
-4. On first install, optionally configure the HTTP/HTTPS allowlist.
+4. On first install, optionally configure the runtime allowlist.
 5. Write `proxy.js`, generate the systemd unit, then enable and restart the service.
 
 If `proxy.js` is not present locally, the script downloads it from `PROXY_JS_URL`, which defaults to the upstream repo. For forks, override it:
@@ -45,12 +45,23 @@ Priority: `--lang` flag > `ANY_PROXY_LANG` env > default English.
 
 ## Allowlist
 
-- Only enforced on HTTP/HTTPS; WebSocket upgrades always bypass it.
 - Empty list means allow all.
 - Accepts single IPs and CIDRs, e.g. `192.168.1.10`, `192.168.0.0/16`, `10.0.0.0/24`. IPv4 and IPv6 are both supported.
 - Entries are stored in `/etc/any-proxy.allowlist`. Re-run `install.sh` to add/remove them interactively.
+- HTTP/HTTPS checks the client source IP only.
+- WebSocket allows the connection when either the client source IP or the downstream target IP resolves into the allowlist.
 
 After modifying the allowlist, you must **re-run `install.sh`** (or restart the service manually) so that systemd reloads the new `ALLOWLIST` environment variable.
+
+## WebSocket queue limit
+
+`WS_QUEUE_LIMIT_BYTES` controls how many bytes may be buffered before the downstream WebSocket is open. The runtime default is `1048576` bytes.
+
+For systemd installs, export it before running the installer to persist it into the service file:
+
+```bash
+WS_QUEUE_LIMIT_BYTES=2097152 bash install.sh
+```
 
 ## Uninstall
 
